@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +12,7 @@ import (
 	"time"
 )
 
-// CheckResult defines the structure of the JSON response for clear and predictable output.
+// CheckResult defines the structure of the JSON response for clear, predictable output.
 type CheckResult struct {
 	Success    bool              `json:"success"`
 	TestedIP   string            `json:"tested_ip"`
@@ -26,15 +24,11 @@ type CheckResult struct {
 }
 
 func main() {
-	// Register the handler for the /check endpoint.
 	http.HandleFunc("/check", checkHandler)
 
-	// Determine the port to listen on, defaulting to 8080.
-	// Cloud platforms often set the PORT environment variable.
 	port := getEnv("PORT", "8080")
 	fmt.Printf("Server starting on port %s...\n", port)
 	
-	// Start the HTTP server.
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		fmt.Printf("Error starting server: %s\n", err)
 		os.Exit(1)
@@ -42,15 +36,13 @@ func main() {
 }
 
 func checkHandler(w http.ResponseWriter, r *http.Request) {
-	// Set headers for CORS and JSON content type.
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Content-Type", "application/json")
 
-	// Extract and validate required query parameters.
 	queryParams := r.URL.Query()
 	ipToTest := queryParams.Get("ip")
 	host := queryParams.Get("host")
-	port := getEnv(queryParams.Get("port"), "443")
+	port := queryParams.Get("port")
 
 	if ipToTest == "" || host == "" {
 		w.WriteHeader(http.StatusBadRequest)
@@ -61,63 +53,66 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// --- Core Logic: The definitive method for proxy verification ---
-
-	// 1. Establish a TCP connection with a strict timeout.
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.Dial("tcp", net.JoinHostPort(ipToTest, port))
-	if err != nil {
-		w.WriteHeader(http.StatusBadGateway)
-		json.NewEncoder(w).Encode(CheckResult{
-			Success:  false,
-			TestedIP: ipToTest,
-			UsedHost: host,
-			Message:  "TCP connection failed.",
-			Error:    err.Error(),
-		})
-		return
+	if port == "" {
+		port = "443" // Default HTTPS port.
 	}
-	defer conn.Close()
 
-	// 2. Initiate a TLS handshake over the established connection, providing the crucial SNI.
-	tlsConn := tls.Client(conn, &tls.Config{
-		ServerName:         host, // This ensures the correct SNI is sent.
-		InsecureSkipVerify: true, // We don't validate the cert, we just need to establish a TLS session.
-	})
+	// --- The Definitive and Robust Go Logic ---
 
-	// 3. Send a well-formed HTTP GET request for /cdn-cgi/trace.
-	req, _ := http.NewRequestWithContext(r.Context(), "GET", "https://"+host+"/cdn-cgi/trace", nil)
-	req.Host = host
-	req.Header.Set("User-Agent", "Go-Proxy-Checker/2.0")
+	// Create a custom dialer that connects to our target IP and port.
+	dialer := &net.Dialer{
+		Timeout: 5 * time.Second,
+	}
 
-	if err := req.Write(tlsConn); err != nil {
+	// Create a custom HTTP transport.
+	// This is the standard Go way to control connection behavior.
+	transport := &http.Transport{
+		// Force the transport to use our custom dialer.
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Ignore the address provided by the transport (which would be the resolved 'host').
+			// Instead, use the IP and port we want to test.
+			return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ipToTest, port))
+		},
+		// The TLSClientConfig will automatically use the request's Host for the SNI.
+		// This is exactly what we need.
+		TLSClientConfig: &http.TLSClientConfig{
+			ServerName:         host,
+			InsecureSkipVerify: true, // We don't need to verify the certificate chain.
+		},
+	}
+
+	// Create an HTTP client that uses our custom transport.
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   10 * time.Second, // Overall timeout for the request.
+	}
+
+	// Create the request to the /cdn-cgi/trace endpoint.
+	// The URL must use HTTPS and the correct host to set the SNI.
+	requestUrl := "https://" + host + "/cdn-cgi/trace"
+	req, err := http.NewRequestWithContext(r.Context(), "GET", requestUrl, nil)
+	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(CheckResult{
-			Success:  false,
-			TestedIP: ipToTest,
-			UsedHost: host,
-			Message:  "Failed to write HTTP request over TLS.",
-			Error:    err.Error(),
-		})
+		json.NewEncoder(w).Encode(CheckResult{Success: false, Error: "Failed to create request."})
 		return
 	}
+	req.Header.Set("User-Agent", "Go-Proxy-Checker/3.0")
 
-	// 4. Read the server's response.
-	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
+	// Execute the request using our custom client.
+	resp, err := client.Do(req)
 	if err != nil {
 		w.WriteHeader(http.StatusBadGateway)
 		json.NewEncoder(w).Encode(CheckResult{
 			Success:  false,
 			TestedIP: ipToTest,
 			UsedHost: host,
-			Message:  "Failed to read HTTP response from the target server.",
+			Message:  "Request failed. The IP may not be a valid proxy for this host.",
 			Error:    err.Error(),
 		})
 		return
 	}
 	defer resp.Body.Close()
 
-	// 5. Parse the trace data and perform the final, strict validation.
 	body, _ := io.ReadAll(resp.Body)
 	traceData := parseTrace(string(body))
 	reportedIP := traceData["ip"]
@@ -134,7 +129,7 @@ func checkHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// parseTrace is a robust helper function to parse the key-value trace output.
+// Helper function to parse the key-value trace output.
 func parseTrace(trace string) map[string]string {
 	data := make(map[string]string)
 	scanner := bufio.NewScanner(strings.NewReader(trace))
@@ -148,7 +143,7 @@ func parseTrace(trace string) map[string]string {
 	return data
 }
 
-// getEnv is a helper function to read an environment variable or return a fallback value.
+// Helper function to read an environment variable or return a fallback value.
 func getEnv(key, fallback string) string {
     if value, ok := os.LookupEnv(key); ok {
         return value
